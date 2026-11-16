@@ -1,0 +1,119 @@
+# kubectl apply -f deploy/k8s/catalogsnap.yaml
+# Assumes Redis and an S3-compatible store are reachable at the addresses in the ConfigMap,
+# and that metrics-server is installed (the HPA needs it).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: catalogsnap
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: catalogsnap-config
+  namespace: catalogsnap
+data:
+  CATALOGSNAP_QUEUE_BACKEND: redis
+  CATALOGSNAP_REDIS_URL: redis://redis.catalogsnap.svc:6379/0
+  CATALOGSNAP_STORAGE_BACKEND: s3
+  CATALOGSNAP_S3_ENDPOINT_URL: http://minio.catalogsnap.svc:9000
+  CATALOGSNAP_S3_BUCKET: catalogsnap
+  CATALOGSNAP_SCENE_BACKEND: studio
+---
+# Create the real secret out of band, for example:
+#   kubectl -n catalogsnap create secret generic catalogsnap-secrets \
+#     --from-literal=CATALOGSNAP_S3_ACCESS_KEY=... \
+#     --from-literal=CATALOGSNAP_S3_SECRET_KEY=... \
+#     --from-literal=CATALOGSNAP_BFL_API_KEY=...
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: catalogsnap-api
+  namespace: catalogsnap
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: catalogsnap-api }
+  template:
+    metadata:
+      labels: { app: catalogsnap-api }
+    spec:
+      containers:
+        - name: api
+          image: catalogsnap:0.1.0
+          args: ["catalogsnap", "serve", "--host", "0.0.0.0", "--port", "8000"]
+          ports: [{ containerPort: 8000 }]
+          envFrom:
+            - configMapRef: { name: catalogsnap-config }
+            - secretRef: { name: catalogsnap-secrets }
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8000 }
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8000 }
+            initialDelaySeconds: 15
+          resources:
+            requests: { cpu: 200m, memory: 256Mi }
+            limits: { cpu: "1", memory: 512Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: catalogsnap-api
+  namespace: catalogsnap
+spec:
+  selector: { app: catalogsnap-api }
+  ports: [{ port: 80, targetPort: 8000 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: catalogsnap-worker
+  namespace: catalogsnap
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: catalogsnap-worker }
+  template:
+    metadata:
+      labels: { app: catalogsnap-worker }
+    spec:
+      # Long enough for a worker to finish its current image after SIGTERM on scale-down.
+      terminationGracePeriodSeconds: 120
+      containers:
+        - name: worker
+          image: catalogsnap:0.1.0
+          args: ["catalogsnap", "worker"]
+          envFrom:
+            - configMapRef: { name: catalogsnap-config }
+            - secretRef: { name: catalogsnap-secrets }
+          resources:
+            # BiRefNet on CPU is the hot path; one worker saturates roughly two cores.
+            requests: { cpu: "1", memory: 2Gi }
+            limits: { cpu: "2", memory: 4Gi }
+---
+# Workers are CPU-bound while there is work and idle when the queue is empty,
+# so CPU utilization tracks queue backlog closely enough to scale on.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: catalogsnap-worker
+  namespace: catalogsnap
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: catalogsnap-worker
+  minReplicas: 1
+  maxReplicas: 12
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target: { type: Utilization, averageUtilization: 60 }
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies: [{ type: Percent, value: 100, periodSeconds: 30 }]
+    scaleDown:
+      stabilizationWindowSeconds: 180
+      policies: [{ type: Pods, value: 2, periodSeconds: 60 }]
